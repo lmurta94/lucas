@@ -1,0 +1,11 @@
+1 - Latência média (média móvel):
+rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m])
+
+2 - Percentil 95 (ou outro percentil):
+histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (path, method, le))
+
+3- Taxa de requisições:
+rate(http_request_duration_seconds_count[5m])
+
+4 - Taxa de erros:
+sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) by (path) / sum(rate(http_request_duration_seconds_count[5m])) by (path)
