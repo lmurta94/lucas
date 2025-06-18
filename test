@@ -1,0 +1,500 @@
+// 1. Configuração no application.properties para SmallRye SQS
+/*
+# Configuração do canal principal SQS
+mp.messaging.incoming.messages.connector=smallrye-sqs
+mp.messaging.incoming.messages.queue=main-queue
+mp.messaging.incoming.messages.region=us-east-1
+mp.messaging.incoming.messages.access-key=${AWS_ACCESS_KEY_ID}
+mp.messaging.incoming.messages.secret-key=${AWS_SECRET_ACCESS_KEY}
+
+# Configuração da DLQ SQS
+mp.messaging.outgoing.dlq.connector=smallrye-sqs
+mp.messaging.outgoing.dlq.queue=dead-letter-queue
+mp.messaging.outgoing.dlq.region=us-east-1
+mp.messaging.outgoing.dlq.access-key=${AWS_ACCESS_KEY_ID}
+mp.messaging.outgoing.dlq.secret-key=${AWS_SECRET_ACCESS_KEY}
+
+# Consumer da DLQ (opcional)
+mp.messaging.incoming.dlq-consumer.connector=smallrye-sqs
+mp.messaging.incoming.dlq-consumer.queue=dead-letter-queue
+mp.messaging.incoming.dlq-consumer.region=us-east-1
+mp.messaging.incoming.dlq-consumer.access-key=${AWS_ACCESS_KEY_ID}
+mp.messaging.incoming.dlq-consumer.secret-key=${AWS_SECRET_ACCESS_KEY}
+*/
+
+import io.smallrye.reactive.messaging.annotations.Blocking;
+import io.smallrye.reactive.messaging.sqs.SqsInboundMetadata;
+import io.smallrye.reactive.messaging.sqs.SqsOutboundMetadata;
+import org.eclipse.microprofile.reactive.messaging.*;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import software.amazon.awssdk.services.sqs.model.MessageAttributeValue;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import com.fasterxml.jackson.databind.JsonNode;
+
+import jakarta.enterprise.context.ApplicationScoped;
+import jakarta.inject.Inject;
+import java.time.LocalDateTime;
+import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
+import java.util.Map;
+import java.util.concurrent.CompletableFuture;
+import java.util.concurrent.CompletionStage;
+import java.util.Optional;
+
+@ApplicationScoped
+public class SQSMessageProcessor {
+
+    private static final Logger logger = LoggerFactory.getLogger(SQSMessageProcessor.class);
+
+    @Inject
+    @Channel("dlq")
+    Emitter<String> dlqEmitter;
+
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Incoming("messages")
+    @Blocking
+    public CompletionStage<Void> processMessage(Message<String> message) {
+        try {
+            String payload = message.getPayload();
+            logger.debug("Recebida mensagem: {}", payload);
+            
+            // Extrair metadados SQS
+            Optional<SqsInboundMetadata> sqsMetadata = message.getMetadata(SqsInboundMetadata.class);
+            
+            // Extrair applicationId do payload JSON
+            String applicationId = extractApplicationIdFromPayload(payload);
+            
+            // Validar propriedades obrigatórias
+            ValidationResult validation = validateMessage(payload, applicationId);
+            
+            if (!validation.isValid()) {
+                logger.warn("Mensagem inválida detectada: {}", validation.getError());
+                
+                // Enviar para DLQ com informações do erro
+                return sendToDLQ(message, validation.getError(), sqsMetadata, applicationId)
+                    .thenCompose(v -> message.ack()) // ACK remove automaticamente da fila original
+                    .exceptionally(throwable -> {
+                        logger.error("Erro ao processar mensagem inválida", throwable);
+                        message.nack(throwable);
+                        return null;
+                    });
+            }
+
+            // Processar mensagem válida
+            return processValidMessage(payload, applicationId)
+                .thenCompose(v -> message.ack())
+                .exceptionally(throwable -> {
+                    logger.error("Erro ao processar mensagem válida", throwable);
+                    // Em caso de erro no processamento, também enviar para DLQ
+                    sendToDLQ(message, "Erro no processamento: " + throwable.getMessage(), 
+                             sqsMetadata, applicationId);
+                    message.nack(throwable);
+                    return null;
+                });
+
+        } catch (Exception e) {
+            logger.error("Erro inesperado no processamento", e);
+            Optional<SqsInboundMetadata> sqsMetadata = message.getMetadata(SqsInboundMetadata.class);
+            sendToDLQ(message, "Erro inesperado: " + e.getMessage(), sqsMetadata, null);
+            return message.nack(e);
+        }
+    }
+
+    private String extractApplicationIdFromPayload(String payload) {
+        try {
+            if (payload == null || payload.trim().isEmpty()) {
+                return null;
+            }
+
+            JsonNode jsonNode = objectMapper.readTree(payload);
+            
+            // Tentar diferentes possíveis campos para applicationId
+            JsonNode appIdNode = jsonNode.get("applicationId");
+            if (appIdNode != null && !appIdNode.isNull()) {
+                return appIdNode.asText();
+            }
+
+            // Tentar outras variações comuns
+            appIdNode = jsonNode.get("appId");
+            if (appIdNode != null && !appIdNode.isNull()) {
+                return appIdNode.asText();
+            }
+
+            appIdNode = jsonNode.get("application_id");
+            if (appIdNode != null && !appIdNode.isNull()) {
+                return appIdNode.asText();
+            }
+
+            // Se estiver em um objeto aninhado
+            JsonNode headerNode = jsonNode.get("header");
+            if (headerNode != null) {
+                JsonNode nestedAppId = headerNode.get("applicationId");
+                if (nestedAppId != null && !nestedAppId.isNull()) {
+                    return nestedAppId.asText();
+                }
+            }
+
+            return null;
+
+        } catch (Exception e) {
+            logger.warn("Erro ao extrair applicationId do payload: {}", e.getMessage());
+            return null;
+        }
+    }
+
+    private ValidationResult validateMessage(String payload, String applicationId) {
+        // Validar se o payload não está vazio
+        if (payload == null || payload.trim().isEmpty()) {
+            return ValidationResult.invalid("Payload da mensagem está vazio ou nulo");
+        }
+
+        // Validar se é um JSON válido
+        try {
+            objectMapper.readTree(payload);
+        } catch (Exception e) {
+            return ValidationResult.invalid("Payload não é um JSON válido: " + e.getMessage());
+        }
+
+        // Validar applicationId
+        if (applicationId == null || applicationId.trim().isEmpty()) {
+            return ValidationResult.invalid("ApplicationId está ausente ou nulo no payload");
+        }
+
+        // Validações adicionais do payload
+        try {
+            JsonNode jsonNode = objectMapper.readTree(payload);
+            
+            // Exemplo: validar se existe um campo obrigatório "messageType"
+            JsonNode messageTypeNode = jsonNode.get("messageType");
+            if (messageTypeNode == null || messageTypeNode.isNull() || 
+                messageTypeNode.asText().trim().isEmpty()) {
+                return ValidationResult.invalid("Campo 'messageType' está ausente ou nulo no payload");
+            }
+
+            // Exemplo: validar se existe timestamp
+            JsonNode timestampNode = jsonNode.get("timestamp");
+            if (timestampNode == null || timestampNode.isNull()) {
+                return ValidationResult.invalid("Campo 'timestamp' está ausente ou nulo no payload");
+            }
+
+            // Adicione outras validações conforme necessário
+            
+        } catch (Exception e) {
+            return ValidationResult.invalid("Erro na validação do payload: " + e.getMessage());
+        }
+
+        return ValidationResult.valid();
+    }
+
+    private CompletionStage<Void> sendToDLQ(Message<String> originalMessage, String errorReason,
+                                          Optional<SqsInboundMetadata> originalMetadata, 
+                                          String applicationId) {
+        try {
+            // Criar payload para DLQ com informações do erro
+            DLQMessage dlqMessage = createDLQMessage(originalMessage, errorReason, 
+                                                   originalMetadata, applicationId);
+            String dlqPayload = serializeDLQMessage(dlqMessage);
+
+            // Criar message attributes para SQS DLQ
+            Map<String, MessageAttributeValue> dlqAttributes = new HashMap<>();
+            
+            dlqAttributes.put("errorReason", MessageAttributeValue.builder()
+                .dataType("String")
+                .stringValue(truncateString(errorReason, 256)) // SQS limit
+                .build());
+                
+            dlqAttributes.put("dlqTimestamp", MessageAttributeValue.builder()
+                .dataType("String")
+                .stringValue(dlqMessage.getDlqTimestamp())
+                .build());
+                
+            dlqAttributes.put("originalApplicationId", MessageAttributeValue.builder()
+                .dataType("String")
+                .stringValue(applicationId != null ? truncateString(applicationId, 256) : "null")
+                .build());
+
+            dlqAttributes.put("processingAttempts", MessageAttributeValue.builder()
+                .dataType("Number")
+                .stringValue("1")
+                .build());
+
+            // Criar metadados SQS para DLQ
+            SqsOutboundMetadata.Builder metadataBuilder = SqsOutboundMetadata.builder()
+                .messageAttributes(dlqAttributes);
+
+            // Se for uma fila FIFO, adicionar groupId e deduplicationId
+            String queueName = originalMetadata
+                .map(SqsInboundMetadata::getQueueName)
+                .orElse("unknown");
+            
+            if (queueName.endsWith(".fifo")) {
+                metadataBuilder
+                    .messageGroupId("dlq-messages")
+                    .messageDeduplicationId(generateDeduplicationId(originalMessage, errorReason));
+            }
+
+            SqsOutboundMetadata dlqMetadata = metadataBuilder.build();
+
+            // Enviar para DLQ
+            Message<String> dlqMsg = Message.of(dlqPayload).addMetadata(dlqMetadata);
+            
+            return dlqEmitter.send(dlqMsg)
+                .thenRun(() -> {
+                    logger.info("Mensagem enviada para DLQ. ApplicationId: {}, Motivo: {}", 
+                              applicationId, errorReason);
+                });
+
+        } catch (Exception e) {
+            logger.error("Erro ao criar mensagem DLQ", e);
+            return CompletableFuture.failedFuture(e);
+        }
+    }
+
+    private String truncateString(String value, int maxLength) {
+        if (value == null) return null;
+        return value.length() > maxLength ? value.substring(0, maxLength) : value;
+    }
+
+    private String generateDeduplicationId(Message<String> message, String errorReason) {
+        // Gera um ID único baseado no conteúdo para evitar duplicatas na DLQ
+        String content = message.getPayload() + errorReason + System.currentTimeMillis();
+        return "dlq-" + Math.abs(content.hashCode());
+    }
+
+    private DLQMessage createDLQMessage(Message<String> originalMessage, String errorReason,
+                                      Optional<SqsInboundMetadata> originalMetadata, 
+                                      String applicationId) {
+        String originalPayload = originalMessage.getPayload();
+        
+        // Extrair informações adicionais do SQS
+        String messageId = originalMetadata
+            .map(SqsInboundMetadata::getMessageId)
+            .orElse("unknown");
+        
+        String queueName = originalMetadata
+            .map(SqsInboundMetadata::getQueueName)
+            .orElse("unknown");
+        
+        return DLQMessage.builder()
+            .originalPayload(originalPayload)
+            .applicationId(applicationId)
+            .errorReason(errorReason)
+            .originalMessageId(messageId)
+            .originalQueueName(queueName)
+            .originalTimestamp(LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+            .dlqTimestamp(LocalDateTime.now().format(DateTimeFormatter.ISO_LOCAL_DATE_TIME))
+            .build();
+    }
+
+    private String serializeDLQMessage(DLQMessage dlqMessage) {
+        try {
+            // Usar Jackson para serialização adequada
+            return objectMapper.writeValueAsString(dlqMessage);
+        } catch (Exception e) {
+            logger.error("Erro ao serializar DLQ message, usando fallback", e);
+            // Fallback para serialização manual
+            return String.format("""
+                {
+                    "originalPayload": %s,
+                    "applicationId": %s,
+                    "errorReason": "%s",
+                    "originalMessageId": "%s",
+                    "originalQueueName": "%s",
+                    "originalTimestamp": "%s",
+                    "dlqTimestamp": "%s"
+                }
+                """,
+                dlqMessage.getOriginalPayload() != null ? 
+                    "\"" + escapeJson(dlqMessage.getOriginalPayload()) + "\"" : "null",
+                dlqMessage.getApplicationId() != null ? 
+                    "\"" + escapeJson(dlqMessage.getApplicationId()) + "\"" : "null",
+                escapeJson(dlqMessage.getErrorReason()),
+                escapeJson(dlqMessage.getOriginalMessageId()),
+                escapeJson(dlqMessage.getOriginalQueueName()),
+                dlqMessage.getOriginalTimestamp(),
+                dlqMessage.getDlqTimestamp()
+            );
+        }
+    }
+
+    private String escapeJson(String value) {
+        if (value == null) return "null";
+        return value.replace("\\", "\\\\")
+                   .replace("\"", "\\\"")
+                   .replace("\n", "\\n")
+                   .replace("\r", "\\r")
+                   .replace("\t", "\\t");
+    }
+
+    private CompletionStage<Void> processValidMessage(String payload, String applicationId) {
+        logger.info("Processando mensagem válida para applicationId: {}", applicationId);
+        
+        return CompletableFuture.runAsync(() -> {
+            try {
+                // Sua lógica de processamento aqui
+                JsonNode jsonNode = objectMapper.readTree(payload);
+                String messageType = jsonNode.get("messageType").asText();
+                
+                logger.info("Processando mensagem do tipo: {} para aplicação: {}", 
+                           messageType, applicationId);
+                
+                // Simular processamento
+                Thread.sleep(100);
+                logger.info("Mensagem processada com sucesso");
+                
+            } catch (Exception e) {
+                logger.error("Erro no processamento da mensagem", e);
+                throw new RuntimeException("Erro no processamento", e);
+            }
+        });
+    }
+
+    // Classes auxiliares
+    public static class ValidationResult {
+        private final boolean valid;
+        private final String error;
+
+        private ValidationResult(boolean valid, String error) {
+            this.valid = valid;
+            this.error = error;
+        }
+
+        public static ValidationResult valid() {
+            return new ValidationResult(true, null);
+        }
+
+        public static ValidationResult invalid(String error) {
+            return new ValidationResult(false, error);
+        }
+
+        public boolean isValid() { return valid; }
+        public String getError() { return error; }
+    }
+
+    public static class DLQMessage {
+        private String originalPayload;
+        private String applicationId;
+        private String errorReason;
+        private String originalMessageId;
+        private String originalQueueName;
+        private String originalTimestamp;
+        private String dlqTimestamp;
+
+        public DLQMessage() {} // Para Jackson
+
+        public static Builder builder() {
+            return new Builder();
+        }
+
+        public static class Builder {
+            private DLQMessage message = new DLQMessage();
+
+            public Builder originalPayload(String originalPayload) {
+                message.originalPayload = originalPayload;
+                return this;
+            }
+
+            public Builder applicationId(String applicationId) {
+                message.applicationId = applicationId;
+                return this;
+            }
+
+            public Builder errorReason(String errorReason) {
+                message.errorReason = errorReason;
+                return this;
+            }
+
+            public Builder originalMessageId(String originalMessageId) {
+                message.originalMessageId = originalMessageId;
+                return this;
+            }
+
+            public Builder originalQueueName(String originalQueueName) {
+                message.originalQueueName = originalQueueName;
+                return this;
+            }
+
+            public Builder originalTimestamp(String originalTimestamp) {
+                message.originalTimestamp = originalTimestamp;
+                return this;
+            }
+
+            public Builder dlqTimestamp(String dlqTimestamp) {
+                message.dlqTimestamp = dlqTimestamp;
+                return this;
+            }
+
+            public DLQMessage build() {
+                return message;
+            }
+        }
+
+        // Getters e Setters para Jackson
+        public String getOriginalPayload() { return originalPayload; }
+        public void setOriginalPayload(String originalPayload) { this.originalPayload = originalPayload; }
+        
+        public String getApplicationId() { return applicationId; }
+        public void setApplicationId(String applicationId) { this.applicationId = applicationId; }
+        
+        public String getErrorReason() { return errorReason; }
+        public void setErrorReason(String errorReason) { this.errorReason = errorReason; }
+        
+        public String getOriginalMessageId() { return originalMessageId; }
+        public void setOriginalMessageId(String originalMessageId) { this.originalMessageId = originalMessageId; }
+        
+        public String getOriginalQueueName() { return originalQueueName; }
+        public void setOriginalQueueName(String originalQueueName) { this.originalQueueName = originalQueueName; }
+        
+        public String getOriginalTimestamp() { return originalTimestamp; }
+        public void setOriginalTimestamp(String originalTimestamp) { this.originalTimestamp = originalTimestamp; }
+        
+        public String getDlqTimestamp() { return dlqTimestamp; }
+        public void setDlqTimestamp(String dlqTimestamp) { this.dlqTimestamp = dlqTimestamp; }
+    }
+}
+
+// 2. Consumer da DLQ para limpeza automática
+@ApplicationScoped
+public class SQSDLQCleaner {
+
+    private static final Logger logger = LoggerFactory.getLogger(SQSDLQCleaner.class);
+    private final ObjectMapper objectMapper = new ObjectMapper();
+
+    @Incoming("dlq-consumer")
+    @Blocking
+    public CompletionStage<Void> processDLQMessage(Message<String> message) {
+        try {
+            String payload = message.getPayload();
+            Optional<SqsInboundMetadata> sqsMetadata = message.getMetadata(SqsInboundMetadata.class);
+            
+            logger.info("Processando mensagem da DLQ para limpeza");
+            
+            // Deserializar a mensagem DLQ
+            SQSMessageProcessor.DLQMessage dlqMessage = objectMapper.readValue(payload, 
+                                                      SQSMessageProcessor.DLQMessage.class);
+            
+            logger.info("DLQ Message - ApplicationId: {}, Erro: {}, Timestamp: {}", 
+                       dlqMessage.getApplicationId(), 
+                       dlqMessage.getErrorReason(),
+                       dlqMessage.getDlqTimestamp());
+            
+            // Aqui você pode:
+            // 1. Registrar em um banco de dados para auditoria
+            // 2. Enviar notificação para administradores
+            // 3. Tentar reprocessar após correção manual
+            // 4. Implementar retry logic com backoff
+            
+            // Fazer ACK para remover automaticamente da DLQ
+            return message.ack().thenRun(() -> {
+                logger.info("Mensagem DLQ processada e removida da fila");
+            });
+            
+        } catch (Exception e) {
+            logger.error("Erro ao processar mensagem da DLQ", e);
+            // NACK para reprocessar mais tarde (cuidado com loops infinitos)
+            return message.nack(e);
+        }
+    }
+}
