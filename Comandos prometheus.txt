@@ -1,11 +1,67 @@
-1 - Latência média (média móvel):
-rate(http_request_duration_seconds_sum[5m]) / rate(http_request_duration_seconds_count[5m])
+import io.agroal.api.AgroalDataSource;
+import org.hibernate.Session;
+import org.hibernate.stat.Statistics;
+import jakarta.inject.Inject;
+import jakarta.transaction.Transactional;
+import jakarta.enterprise.context.ApplicationScoped;
 
-2 - Percentil 95 (ou outro percentil):
-histogram_quantile(0.95, sum(rate(http_request_duration_seconds_bucket[5m])) by (path, method, le))
+@ApplicationScoped
+public class PedidoService {
 
-3- Taxa de requisições:
-rate(http_request_duration_seconds_count[5m])
+    @Inject
+    EntityManager em;
 
-4 - Taxa de erros:
-sum(rate(http_request_duration_seconds_count{status=~"5.."}[5m])) by (path) / sum(rate(http_request_duration_seconds_count[5m])) by (path)
+    @Inject
+    AgroalDataSource dataSource; // Injeta o gerenciador de conexões
+
+    @Transactional
+    public void compararDesempenho(Long id) {
+        
+        // --- 1. Estado Inicial (Antes de tudo) ---
+        System.out.println("--- INÍCIO: Pool de Conexões ---");
+        verConexoes(); // Deve mostrar 0 ou 1 ativa (a própria transação)
+
+        Statistics stats = em.unwrap(Session.class).getSessionFactory().getStatistics();
+        stats.clear();
+        
+        long inicio = System.nanoTime();
+
+        // --- CENÁRIO 1 ---
+        Pedido p1 = Pedido.find("#Pedido.comItens", id).firstResult();
+        
+        long fimJoinFetch = System.nanoTime();
+        
+        System.out.println("--- APÓS JOIN FETCH ---");
+        verConexoes(); // Ainda deve ser 1 conexão ativa
+        
+        stats.clear();
+        
+        // --- CENÁRIO 2 ---
+        Pedido p2 = Pedido.findById(id);
+        p2.itens.size(); 
+
+        long fimBatchSize = System.nanoTime();
+
+        System.out.println("--- APÓS BATCH SIZE ---");
+        verConexoes(); // Ainda deve ser 1 conexão ativa
+
+        // ... Impressão dos resultados de tempo ...
+    }
+
+    // Método auxiliar para não repetir código
+    private void verConexoes() {
+        System.out.println("Conexões ativas: " + dataSource.getMetrics().activeCount());
+        System.out.println("Conexões disponíveis: " + dataSource.getMetrics().availableCount());
+    }
+}
+
+# Habilita as estatísticas do Hibernate (tem leve impacto em performance, use em dev/test)
+quarkus.hibernate-orm.statistics=true
+
+# Mostra as queries SQL no console (essencial para ver quantas queries estão rodando)
+quarkus.hibernate-orm.log.sql=true
+
+# Mostra parâmetros das queries (opcional)
+quarkus.hibernate-orm.log.bind-parameters=true
+
+quarkus.datasource.metrics.enabled=true
